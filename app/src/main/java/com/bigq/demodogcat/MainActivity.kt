@@ -24,26 +24,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             DemoDogCatTheme {
-               ScreenRecordDemo(
-                   onStartRecord = {
-                       startActivityForResult(
-                           projectionManager.createScreenCaptureIntent(),
-                           REQUEST_CODE
-                       )
-                   }
-               )
+               CameraScreen()
             }
-        }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode == REQUEST_CODE && resultCode == RESULT_OK) {
-            val intent = Intent(this, ScreenRecordService::class.java)
-            intent.putExtra("resultCode", resultCode)
-            intent.putExtra("data", data)
-            startForegroundService(intent)
         }
     }
 }
