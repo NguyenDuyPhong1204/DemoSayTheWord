@@ -1,19 +1,19 @@
 package com.bigq.demodogcat.opengl
 
-import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import android.net.Uri
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
@@ -30,12 +30,8 @@ import android.provider.MediaStore
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
-import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.graphics.createBitmap
 import com.bigq.demodogcat.saytheword.WordItem
-import com.bigq.demodogcat.saytheword.wordList
-import timber.log.Timber
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -43,7 +39,6 @@ import java.nio.FloatBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -62,9 +57,11 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         private const val TAG = "CameraGLSurfaceView"
         private const val MIME_TYPE = "video/avc"
         private const val BIT_RATE = 8_000_000
-        private const val FRAME_RATE = 60
+        private const val FRAME_RATE = 30 // 30fps is safer for more devices
         private const val I_FRAME_INTERVAL = 1
         private const val EGL_RECORDABLE_ANDROID = 0x3142
+        private const val MAX_VIDEO_WIDTH = 1080
+        private const val MAX_VIDEO_HEIGHT = 1920
     }
 
     // Camera texture
@@ -100,6 +97,8 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     // Dimensions
     private var viewWidth = 0
     private var viewHeight = 0
+    private var videoWidth = 0   // Actual video dimensions (aligned to 16)
+    private var videoHeight = 0  // Actual video dimensions (aligned to 16)
 
     // Recording state
     private var isRecording = false
@@ -123,6 +122,20 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
     // Camera facing
     private var isFrontCamera = false
+
+    // Word Animation State
+    private var wordItems: List<WordItem> = emptyList()
+    private var activeWordIndex: Int = -1
+    private val iconCache = mutableMapOf<Int, Bitmap>()
+    private val backgroundPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
+    private val borderPaint = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 5f }
+    private val textPaint = Paint().apply {
+        color = Color.BLACK
+        textSize = 24f
+        isAntiAlias = true
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
 
     // Callbacks
     var onSurfaceTextureReady: ((SurfaceTexture) -> Unit)? = null
@@ -472,7 +485,8 @@ class CameraGLSurfaceView @JvmOverloads constructor(
             }
 
             // Render camera và overlay vào encoder surface
-            GLES20.glViewport(0, 0, viewWidth, viewHeight)
+            // Sử dụng videoWidth/videoHeight thay vì viewWidth/viewHeight để khớp với MediaCodec config
+            GLES20.glViewport(0, 0, videoWidth, videoHeight)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             drawCamera()
             drawOverlay()
@@ -492,20 +506,34 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
         } finally {
             // Phục hồi surface của GLSurfaceView (vẫn dùng cùng context)
-            if (!EGL14.eglMakeCurrent(currentDisplay, savedDrawSurface, savedReadSurface, currentContext)) {
+            if (!EGL14.eglMakeCurrent(
+                    currentDisplay,
+                    savedDrawSurface,
+                    savedReadSurface,
+                    currentContext
+                )
+            ) {
                 Log.e(TAG, "Failed to restore GLSurfaceView surface")
             }
         }
     }
 
     private fun updateOverlayTexture() {
-        // Nếu đang sử dụng custom overlay, upload bitmap đó lên GPU
+        // Nếu có wordItems, ta vẽ giao diện "Say the word" trực tiếp
+        if (wordItems.isNotEmpty()) {
+            drawWordAnimationGrid()
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTextureId)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, overlayBitmap, 0)
+            needsOverlayUpdate = false
+            return
+        }
+
+        // Nếu đang sử dụng custom overlay bitmap (từ ngoài truyền vào)
         if (useCustomOverlay && customOverlayBitmap != null) {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTextureId)
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, customOverlayBitmap, 0)
             needsOverlayUpdate = false
 
-            // Vẫn notify time update nếu đang recording
             if (isRecording) {
                 val elapsed = System.currentTimeMillis() - recordingStartTime
                 val elapsedStr = formatTime(elapsed)
@@ -514,34 +542,33 @@ class CameraGLSurfaceView @JvmOverloads constructor(
             return
         }
 
-        // Fallback: tạo internal overlay
-        val w = 500
+        // Fallback: tạo internal overlay đơn giản nếu không có gì đặc biệt
+        val w = if (viewWidth > 0) viewWidth else 500
         val h = 100
 
-        overlayBitmap?.recycle()
-        overlayBitmap = createBitmap(w, h)
+        if (overlayBitmap == null || overlayBitmap?.width != w || overlayBitmap?.height != h) {
+            overlayBitmap?.recycle()
+            overlayBitmap = createBitmap(w, h)
+        }
 
         val canvas = Canvas(overlayBitmap!!)
-
-        // Text
-        val textPaint = Paint().apply {
-            color = Color.WHITE
-            textSize = 28f
-            isAntiAlias = true
-            typeface = Typeface.DEFAULT_BOLD
-        }
+        canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
 
         if (isRecording) {
             val elapsed = System.currentTimeMillis() - recordingStartTime
             val elapsedStr = formatTime(elapsed)
-            // Notify UI
+            val timePaint = Paint(textPaint).apply {
+                color = Color.RED; textAlign = Paint.Align.RIGHT; textSize = 30f
+            }
+            canvas.drawText("REC $elapsedStr", w - 30f, 60f, timePaint)
             post { onTimeUpdate?.invoke(elapsedStr) }
         }
 
         if (overlayText.isNotEmpty()) {
-            textPaint.color = Color.WHITE
-            textPaint.textSize = 24f
-            canvas.drawText(overlayText, 16f, 90f, textPaint)
+            val textP = Paint(textPaint).apply {
+                color = Color.WHITE; textAlign = Paint.Align.LEFT; textSize = 28f
+            }
+            canvas.drawText(overlayText, 30f, 60f, textP)
         }
 
         // Upload to GPU
@@ -549,6 +576,102 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, overlayBitmap, 0)
 
         needsOverlayUpdate = false
+    }
+
+    private fun drawWordAnimationGrid() {
+        // Overlay chiếm phần trên của video
+        val w = if (videoWidth > 0) videoWidth else (if (viewWidth > 0) viewWidth else 1080)
+        val h = if (videoHeight > 0) (videoHeight * 0.35f).toInt() else 600
+
+        if (overlayBitmap == null || overlayBitmap?.width != w || overlayBitmap?.height != h) {
+            overlayBitmap?.recycle()
+            overlayBitmap = createBitmap(w, h)
+        }
+
+        val canvas = Canvas(overlayBitmap!!)
+        canvas.drawColor(Color.WHITE) // Nền trắng như trong Compose
+
+        // Title 1/5 và Recording time
+        textPaint.textAlign = Paint.Align.LEFT
+        textPaint.textSize = 32f
+        textPaint.color = Color.BLACK
+        canvas.drawText("1/5", 40f, 60f, textPaint)
+
+        if (isRecording) {
+            val elapsed = System.currentTimeMillis() - recordingStartTime
+            val elapsedStr = formatTime(elapsed)
+            val timePaint =
+                Paint(textPaint).apply { color = Color.RED; textAlign = Paint.Align.RIGHT }
+            canvas.drawText("REC $elapsedStr", w - 40f, 60f, timePaint)
+            post { onTimeUpdate?.invoke(elapsedStr) }
+        }
+
+        // Vẽ Grid (4 cột)
+        val cols = 4
+        val padding = 30f
+        val spacing = 20f
+        val gridTop = 100f
+        val itemWidth = (w - 2 * padding - (cols - 1) * spacing) / cols
+        val itemHeight = itemWidth * 1.2f
+
+        for (i in wordItems.indices) {
+            val row = i / cols
+            val col = i % cols
+            val left = padding + col * (itemWidth + spacing)
+            val top = gridTop + row * (itemHeight + spacing)
+            val right = left + itemWidth
+            val bottom = top + itemHeight
+
+            // Vẽ border
+            val isActive = (i == activeWordIndex)
+            borderPaint.color = if (isActive) Color.parseColor("#00C853") else Color.BLACK
+            borderPaint.strokeWidth = if (isActive) 10f else 4f
+            canvas.drawRect(left, top, right, bottom, borderPaint)
+
+            // Vẽ Icon (căn giữa phần trên của item)
+            val item = wordItems[i]
+            val icon = getIconBitmap(item.image)
+            if (icon != null) {
+                val iconSize = itemWidth * 0.55f
+                val iconLeft = left + (itemWidth - iconSize) / 2
+                val iconTop = top + 20f
+                val destRect = RectF(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize)
+                canvas.drawBitmap(icon, null, destRect, null)
+            }
+
+            // Vẽ Label
+            textPaint.textAlign = Paint.Align.CENTER
+            textPaint.textSize = 26f
+            textPaint.color = Color.BLACK
+            canvas.drawText(item.label, left + itemWidth / 2, bottom - 25f, textPaint)
+        }
+    }
+
+    private fun getIconBitmap(resId: Int): Bitmap? {
+        if (!iconCache.containsKey(resId)) {
+            try {
+                iconCache[resId] = BitmapFactory.decodeResource(context.resources, resId)
+            } catch (e: Exception) {
+                return null
+            }
+        }
+        return iconCache[resId]
+    }
+
+    fun setWordItems(items: List<WordItem>) {
+        queueEvent {
+            wordItems = items
+            needsOverlayUpdate = true
+        }
+    }
+
+    fun setActiveWordIndex(index: Int) {
+        queueEvent {
+            if (activeWordIndex != index) {
+                activeWordIndex = index
+                needsOverlayUpdate = true
+            }
+        }
     }
 
     private fun formatTime(ms: Long): String {
@@ -628,18 +751,60 @@ class CameraGLSurfaceView @JvmOverloads constructor(
                 // Create output file
                 outputFile = createOutputFile(ctx)
 
-                // Setup MediaCodec
-                val format = MediaFormat.createVideoFormat(MIME_TYPE, viewWidth, viewHeight).apply {
-                    setInteger(
-                        MediaFormat.KEY_COLOR_FORMAT,
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                    )
-                    setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
-                    setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
+                // Samsung compatibility: Align dimensions to 16 and cap them
+                videoWidth = viewWidth
+                videoHeight = viewHeight
+
+                // Limit resolution for stability on most devices
+                if (videoWidth > MAX_VIDEO_WIDTH || videoHeight > MAX_VIDEO_HEIGHT) {
+                    val ratio = videoWidth.toFloat() / videoHeight.toFloat()
+                    if (videoWidth > videoHeight) {
+                        videoWidth = MAX_VIDEO_WIDTH
+                        videoHeight = (videoWidth / ratio).toInt()
+                    } else {
+                        videoHeight = MAX_VIDEO_HEIGHT
+                        videoWidth = (videoHeight * ratio).toInt()
+                    }
                 }
 
-                mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
+                // Align to 16 (CRITICAL for Samsung MediaCodec / Exynos)
+                videoWidth = (videoWidth / 16) * 16
+                videoHeight = (videoHeight / 16) * 16
+
+                Log.d(
+                    TAG,
+                    "Recording dimensions: $videoWidth x $videoHeight (original: $viewWidth x $viewHeight)"
+                )
+
+                // Setup MediaCodec
+                val format =
+                    MediaFormat.createVideoFormat(MIME_TYPE, videoWidth, videoHeight).apply {
+                        setInteger(
+                            MediaFormat.KEY_COLOR_FORMAT,
+                            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                        )
+                        setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
+                        setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
+                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
+                    }
+
+                // Verify capabilities (Robustness for Samsung)
+                try {
+                    val encoderList =
+                        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+                    val encoderName = encoderList.findEncoderForFormat(format)
+                    if (encoderName != null) {
+                        mediaCodec = MediaCodec.createByCodecName(encoderName)
+                        Log.d(TAG, "Using specific encoder: $encoderName")
+                    } else {
+                        mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
+                        Log.w(TAG, "No specific encoder found for format, fallback to default")
+                    }
+                } catch (e: Exception) {
+                    mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
+                    Log.w(TAG, "Error choosing encoder, fallback to default: ${e.message}")
+                }
+
                 mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 encoderSurface = mediaCodec?.createInputSurface()
                 mediaCodec?.start()
@@ -652,7 +817,13 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
                 // Query config ID từ current context
                 val configId = IntArray(1)
-                EGL14.eglQueryContext(currentDisplay, currentContext, EGL14.EGL_CONFIG_ID, configId, 0)
+                EGL14.eglQueryContext(
+                    currentDisplay,
+                    currentContext,
+                    EGL14.EGL_CONFIG_ID,
+                    configId,
+                    0
+                )
 
                 // Tìm config với ID đó
                 val configAttribs = intArrayOf(
@@ -661,7 +832,16 @@ class CameraGLSurfaceView @JvmOverloads constructor(
                 )
                 val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
                 val numConfigs = IntArray(1)
-                EGL14.eglChooseConfig(currentDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0)
+                EGL14.eglChooseConfig(
+                    currentDisplay,
+                    configAttribs,
+                    0,
+                    configs,
+                    0,
+                    1,
+                    numConfigs,
+                    0
+                )
 
                 val currentConfig = configs[0]
                 Log.d(TAG, "Using config from GLSurfaceView context, configId: ${configId[0]}")
@@ -742,7 +922,10 @@ class CameraGLSurfaceView @JvmOverloads constructor(
                 // Sử dụng file đã ghi trong cache
                 val finalPath = savedOutputFile?.absolutePath
 
-                Log.d(TAG, "Recording stopped, file: $finalPath, exists: ${savedOutputFile?.exists()}, size: ${savedOutputFile?.length()}")
+                Log.d(
+                    TAG,
+                    "Recording stopped, file: $finalPath, exists: ${savedOutputFile?.exists()}, size: ${savedOutputFile?.length()}"
+                )
 
                 // File đã được lưu trong cache, không cần lưu vào gallery
 
@@ -835,6 +1018,7 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
         return File(context.cacheDir, fileName)
     }
+
     private fun saveToGallery(ctx: Context, file: File) {
         try {
             val values = ContentValues().apply {

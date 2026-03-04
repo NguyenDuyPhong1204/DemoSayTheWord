@@ -56,6 +56,7 @@ import com.bigq.demodogcat.Function.copyRawToCache
 import com.bigq.demodogcat.Function.mergeVideoAndAudio
 import com.bigq.demodogcat.opengl.CameraGLSurfaceView
 import com.bigq.demodogcat.saytheword.BoxWordAnimation
+import com.bigq.demodogcat.saytheword.wordList
 import kotlinx.coroutines.delay
 import timber.log.Timber
 import java.text.SimpleDateFormat
@@ -81,30 +82,7 @@ fun CameraScreen() {
         MediaPlayer.create(context, R.raw.song)
     }
 
-    // Update current time every 100ms
-    fun captureOverlayNow() {
-        if (overlaySize.width > 0 && overlaySize.height > 0) {
-
-            val bitmap = createBitmap(overlaySize.width, overlaySize.height)
-            val canvas = android.graphics.Canvas(bitmap)
-            overlayPicture.draw(canvas)
-
-            glSurfaceView?.setCustomOverlayBitmap(bitmap)
-
-            if (containerSize.width > 0 && containerSize.height > 0) {
-
-                val normalizedHeight =
-                    overlaySize.height.toFloat() / containerSize.height
-
-                glSurfaceView?.setOverlayPosition(
-                    0f,
-                    0f,
-                    1f,
-                    normalizedHeight
-                )
-            }
-        }
-    }
+    // Removed captureOverlayNow as rendering is now handled natively in OpenGL
     // Setup camera when SurfaceTexture is ready
     fun setupCamera(surfaceTexture: SurfaceTexture) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -152,21 +130,19 @@ fun CameraScreen() {
         }, ContextCompat.getMainExecutor(context))
     }
     LaunchedEffect(isRecording) {
+        if (!isRecording) {
+            glSurfaceView?.setActiveWordIndex(-1)
+            return@LaunchedEffect
+        }
 
-        if (!isRecording) return@LaunchedEffect
-
-        // capture intro frame
-        captureOverlayNow()
-
+        // Delay 5s trước khi bắt đầu highlight (khớp với nhạc/logic cũ)
         delay(5000)
 
-        while (isRecording) {
-
-            withFrameNanos { }
-
-            captureOverlayNow()
-
-            delay(17) // khớp nhạc
+        // Cập nhật index highlight trực tiếp vào OpenGL
+        for (i in wordList.indices) {
+            if (!isRecording) break
+            glSurfaceView?.setActiveWordIndex(i)
+            delay(400)
         }
     }
     Box(
@@ -186,6 +162,11 @@ fun CameraScreen() {
                     // Set camera facing
                     setFrontCamera(lensFacing == CameraSelector.LENS_FACING_FRONT)
 
+                    // Init word items for native OpenGL rendering
+                    setWordItems(com.bigq.demodogcat.saytheword.wordList)
+                    // Set overlay position to top part (0 to 0.35 normalized)
+                    setOverlayPosition(0f, 0f, 1f, 0.35f)
+
                     // Callback when SurfaceTexture is ready
                     onSurfaceTextureReady = { surfaceTexture ->
                         setupCamera(surfaceTexture)
@@ -196,17 +177,13 @@ fun CameraScreen() {
                         isRecording = recording
 
                         if (!recording && path != null) {
-
                             val audioPath = copyRawToCache(context, R.raw.song)
-
                             val outputPath = path.replace(".mp4", "_final.mp4")
-
                             mergeVideoAndAudio(
                                 videoPath = path,
                                 audioPath = audioPath,
                                 outputPath = outputPath
                             )
-
                             Toast.makeText(context, "Video đã có nhạc!", Toast.LENGTH_LONG).show()
                         }
                     }
@@ -222,38 +199,10 @@ fun CameraScreen() {
             }
         )
 
-        // === COMPOSABLE OVERLAY ===
-        // Overlay này hiển thị trên UI và được capture gửi đến OpenGL để vẽ lên video
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(300.dp)
-                .onGloballyPositioned {
-                    overlaySize = it.size
-                }
-                .drawWithCache {
-                    val width = this.size.width.toInt()
-                    val height = this.size.height.toInt()
-                    onDrawWithContent {
-                        // Capture vào Picture để gửi đến OpenGL
-                        val nativeCanvas = overlayPicture.beginRecording(width, height)
-                        val composeCanvas = Canvas(nativeCanvas)
-                        draw(this, this.layoutDirection, composeCanvas, this.size) {
-                            this@onDrawWithContent.drawContent()
-                        }
-                        overlayPicture.endRecording()
-
-                        // Vẽ lên màn hình
-                        drawContent()
-                    }
-                }
-                .align(Alignment.TopCenter)
-        ) {
-            BoxWordAnimation(
-                isRecording = isRecording,
-            )
-        }
-        // === KẾT THÚC COMPOSABLE OVERLAY ===
+        // Chúng ta vẫn có thể giữ BoxWordAnimation ở UI để preview (nếu muốn) 
+        // nhưng không cần drawWithCache nặng nề nữa. 
+        // Hoặc có thể xóa đi vì OpenGL đã vẽ trực tiếp vào preview.
+        // Ở đây tôi giữ lại ActiveBorderIndex để Sync UI nếu cần.
 
         // Recording indicator at top-center
         if (isRecording) {
