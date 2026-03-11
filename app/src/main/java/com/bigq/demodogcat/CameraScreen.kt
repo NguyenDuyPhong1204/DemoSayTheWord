@@ -15,8 +15,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -33,16 +31,10 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.draw
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
@@ -50,18 +42,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.createBitmap
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.bigq.demodogcat.Function.copyRawToCache
 import com.bigq.demodogcat.Function.mergeVideoAndAudio
 import com.bigq.demodogcat.opengl.CameraGLSurfaceView
-import com.bigq.demodogcat.saytheword.BoxWordAnimation
-import com.bigq.demodogcat.saytheword.wordList
+import com.bigq.demodogcat.saytheword.BoxSayTheWord
+import com.bigq.demodogcat.saytheword.allLevels
 import kotlinx.coroutines.delay
-import timber.log.Timber
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 @Composable
 fun CameraScreen() {
@@ -100,6 +87,10 @@ fun CameraScreen() {
                     val height = request.resolution.height
                     surfaceTexture.setDefaultBufferSize(width, height)
 
+                    // Truyền camera preview size cho GL view để tính aspect ratio
+                    glSurfaceView?.setCameraPreviewSize(width, height)
+                    Log.d("CameraScreenOpenGL", "Camera preview size: ${width}x${height}")
+
                     val surface = Surface(surfaceTexture)
                     request.provideSurface(surface, ContextCompat.getMainExecutor(context)) { }
                 }
@@ -129,27 +120,78 @@ fun CameraScreen() {
             }
         }, ContextCompat.getMainExecutor(context))
     }
+
+    // Level system: lặp qua 5 levels, mỗi level 8 ảnh
+    // *** TÙY CHỈNH DELAY CHO MỖI LEVEL ĐỂ KHỚP VỚI NHẠC ***
     LaunchedEffect(isRecording) {
         if (!isRecording) {
             glSurfaceView?.setActiveWordIndex(-1)
             return@LaunchedEffect
         }
 
-        // Delay 5s trước khi bắt đầu highlight (khớp với nhạc/logic cũ)
-        delay(5000)
+        val totalLevels = allLevels.size  // 5
 
-        // Cập nhật index highlight trực tiếp vào OpenGL
-        for (i in wordList.indices) {
+        // Delay trước khi bắt đầu highlight mỗi level (ms)
+        // Tùy chỉnh để khớp với nhạc
+        val levelStartDelays = longArrayOf(
+            5000L,  // Level 1: delay 5s (nhạc intro)
+            2000L,  // Level 2: delay 3s
+            2000L,  // Level 3: delay 3s
+            2000L,  // Level 4: delay 3s
+            2000L,  // Level 5: delay 3s
+        )
+
+        // Thời gian highlight mỗi ảnh trong level (ms)
+        // Tùy chỉnh để khớp với nhịp nhạc
+        val highlightDelayPerItem = longArrayOf(
+            400L,   // Level 1: 400ms/ảnh
+            400L,   // Level 2: 400ms/ảnh
+            400L,   // Level 3: 400ms/ảnh
+            400L,   // Level 4: 350ms/ảnh (nhanh hơn)
+            400L,   // Level 5: 350ms/ảnh (nhanh hơn)
+        )
+
+        for (levelIndex in 0 until totalLevels) {
             if (!isRecording) break
-            glSurfaceView?.setActiveWordIndex(i)
-            delay(400)
+
+            val currentLevelItems = allLevels[levelIndex]
+
+            // Cập nhật level hiện tại
+            glSurfaceView?.setCurrentLevel(levelIndex + 1)
+            glSurfaceView?.setWordItems(currentLevelItems)
+
+            // Level 1: bắt đầu animation fade-in cho ảnh
+            if (levelIndex == 0) {
+                glSurfaceView?.startItemFadeInAnimation()
+            }
+
+            // Delay trước khi bắt đầu highlight (tùy chỉnh theo level)
+            val startDelay = levelStartDelays.getOrElse(levelIndex) { 3000L }
+            delay(startDelay)
+
+            // Highlight từng ảnh trong level hiện tại
+            val itemDelay = highlightDelayPerItem.getOrElse(levelIndex) { 400L }
+            for (i in currentLevelItems.indices) {
+                if (!isRecording) break
+                glSurfaceView?.setActiveWordIndex(i)
+                delay(itemDelay)
+            }
+
+            // Sau khi highlight xong level này, reset active index
+            glSurfaceView?.setActiveWordIndex(-1)
+
+            // Nếu là level cuối (level 5), tắt border xanh
+            if (levelIndex == totalLevels - 1) {
+                glSurfaceView?.setShowBorder(false)
+            }
         }
     }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .onGloballyPositioned{
+            .onGloballyPositioned {
                 containerSize = it.size
             }
     ) {
@@ -162,10 +204,10 @@ fun CameraScreen() {
                     // Set camera facing
                     setFrontCamera(lensFacing == CameraSelector.LENS_FACING_FRONT)
 
-                    // Init word items for native OpenGL rendering
-                    setWordItems(com.bigq.demodogcat.saytheword.wordList)
+                    // Init word items for native OpenGL rendering (level 1 mặc định)
+                    setWordItems(allLevels[0])
                     // Set overlay position to top part (0 to 0.35 normalized)
-                    setOverlayPosition(0f, 0f, 1f, 0.35f)
+                    setOverlayPosition(0f, 0f, 1f, 0.28f)
 
                     // Callback when SurfaceTexture is ready
                     onSurfaceTextureReady = { surfaceTexture ->
@@ -177,14 +219,45 @@ fun CameraScreen() {
                         isRecording = recording
 
                         if (!recording && path != null) {
-                            val audioPath = copyRawToCache(context, R.raw.song)
-                            val outputPath = path.replace(".mp4", "_final.mp4")
-                            mergeVideoAndAudio(
-                                videoPath = path,
-                                audioPath = audioPath,
-                                outputPath = outputPath
-                            )
-                            Toast.makeText(context, "Video đã có nhạc!", Toast.LENGTH_LONG).show()
+                            // Merge video + audio trên background thread để tránh block UI
+                            Thread {
+                                val audioPath = copyRawToCache(context, R.raw.song)
+                                val outputPath = path.replace(".mp4", "_final.mp4")
+                                val success = mergeVideoAndAudio(
+                                    videoPath = path,
+                                    audioPath = audioPath,
+                                    outputPath = outputPath
+                                )
+                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                    if (success) {
+                                        Toast.makeText(
+                                            context,
+                                            "Video đã có nhạc!",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Lỗi khi ghép nhạc!",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            }.start()
+                        } else if (!recording) {
+                            Toast.makeText(
+                                context,
+                                "Video không ghi được dữ liệu",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+
+                        // Reset state khi dừng quay
+                        if (!recording) {
+                            setCurrentLevel(1)
+                            setShowBorder(true)
+                            setWordItems(allLevels[0])
+                            setActiveWordIndex(-1)
                         }
                     }
 
@@ -198,11 +271,11 @@ fun CameraScreen() {
                 view.setFrontCamera(lensFacing == CameraSelector.LENS_FACING_FRONT)
             }
         )
-
-        // Chúng ta vẫn có thể giữ BoxWordAnimation ở UI để preview (nếu muốn) 
-        // nhưng không cần drawWithCache nặng nề nữa. 
-        // Hoặc có thể xóa đi vì OpenGL đã vẽ trực tiếp vào preview.
-        // Ở đây tôi giữ lại ActiveBorderIndex để Sync UI nếu cần.
+//
+//        BoxSayTheWord(
+//            modifier = Modifier
+//                .align(Alignment.TopCenter)
+//        )
 
         // Recording indicator at top-center
         if (isRecording) {

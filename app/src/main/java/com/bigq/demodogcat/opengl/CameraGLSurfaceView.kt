@@ -31,6 +31,7 @@ import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
 import androidx.core.graphics.createBitmap
+import com.bigq.demodogcat.R
 import com.bigq.demodogcat.saytheword.WordItem
 import java.io.File
 import java.nio.ByteBuffer
@@ -41,6 +42,7 @@ import java.util.Date
 import java.util.Locale
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import androidx.core.graphics.toColorInt
 
 /**
  * GLSurfaceView tích hợp sẵn chức năng quay video với overlay
@@ -100,10 +102,20 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     private var videoWidth = 0   // Actual video dimensions (aligned to 16)
     private var videoHeight = 0  // Actual video dimensions (aligned to 16)
 
+    // Camera preview dimensions (from CameraX)
+    private var cameraPreviewWidth = 0
+    private var cameraPreviewHeight = 0
+
     // Recording state
+    @Volatile
     private var isRecording = false
+    @Volatile
+    private var isEncoderReleased = false  // Guard against calling released codec
     private var recordingStartTime = 0L  // milliseconds for UI display
     private var recordingStartTimeNano = 0L  // nanoseconds for presentation time
+    private var framesSentToEncoder = 0  // Debug counter
+    private var encoderContext: android.opengl.EGLContext = EGL14.EGL_NO_CONTEXT
+    private var encoderEglDisplay: android.opengl.EGLDisplay = EGL14.EGL_NO_DISPLAY
 
     // Encoder
     private var mediaCodec: MediaCodec? = null
@@ -127,6 +139,7 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     private var wordItems: List<WordItem> = emptyList()
     private var activeWordIndex: Int = -1
     private val iconCache = mutableMapOf<Int, Bitmap>()
+    private var backgroundBitmap: Bitmap? = null  // cached background image
     private val backgroundPaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
     private val borderPaint = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 5f }
     private val textPaint = Paint().apply {
@@ -137,10 +150,23 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         typeface = Typeface.DEFAULT_BOLD
     }
 
+    // Level system
+    private var currentLevel: Int = 1       // 1-5
+    private var totalLevels: Int = 5
+    private var showBorder: Boolean = true   // false sau khi hoàn thành level 5
+
+    // Animation state cho fade-in ảnh (level 1)
+    private var itemAlphas: FloatArray = FloatArray(0)  // alpha cho mỗi item (0..255)
+    private var animationStartTimeMs: Long = 0L
+    private var isAnimatingItems: Boolean = false
+    private val animationDurationPerItemMs: Long = 600L  // thời gian fade-in mỗi ảnh
+    private val animationDelayBetweenItemsMs: Long = 200L  // delay giữa các ảnh
+
     // Callbacks
     var onSurfaceTextureReady: ((SurfaceTexture) -> Unit)? = null
     var onRecordingStateChanged: ((Boolean, String?) -> Unit)? = null
     var onTimeUpdate: ((String) -> Unit)? = null
+    var onLevelChanged: ((Int) -> Unit)? = null
 
     // Shaders
     private val cameraVertexShader = """
@@ -295,6 +321,12 @@ class CameraGLSurfaceView @JvmOverloads constructor(
             // Ignore
         }
 
+        // Update animation alphas nếu đang animate
+        if (isAnimatingItems) {
+            updateItemAnimations()
+            needsOverlayUpdate = true
+        }
+
         // Update overlay if needed (chỉ khi có custom overlay hoặc cần update internal)
         if (useCustomOverlay) {
             // Custom overlay - chỉ update khi có bitmap mới
@@ -318,8 +350,12 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         }
 
         // If recording, also draw to encoder surface (luôn vẽ overlay vào video)
-        if (isRecording && encoderEglSurface != EGL14.EGL_NO_SURFACE) {
+        // CRITICAL: Check isEncoderReleased to prevent crash when codec is being released
+        if (isRecording && !isEncoderReleased && encoderEglSurface != EGL14.EGL_NO_SURFACE) {
             drawToEncoder()
+        } else if (isRecording) {
+            // Debug failure case
+            Log.w(TAG, "Recording is true but skipping drawToEncoder! released=$isEncoderReleased, surface=${encoderEglSurface != EGL14.EGL_NO_SURFACE}")
         }
     }
 
@@ -370,11 +406,44 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         val stHandle = GLES20.glGetUniformLocation(cameraProgram, "uSTMatrix")
         val samplerHandle = GLES20.glGetUniformLocation(cameraProgram, "sTexture")
 
-        // MVP matrix - flip horizontally for front camera
+        // MVP matrix - flip horizontally for front camera + aspect ratio correction
         val mvp = FloatArray(16)
         Matrix.setIdentityM(mvp, 0)
         if (isFrontCamera) {
             Matrix.scaleM(mvp, 0, -1f, 1f, 1f)
+        }
+
+        // Center-crop: scale camera feed to fill view while maintaining aspect ratio
+        // This makes the camera look natural like the native camera app
+        if (cameraPreviewWidth > 0 && cameraPreviewHeight > 0 && viewWidth > 0 && viewHeight > 0) {
+            // Camera resolution is in sensor orientation (landscape for most phones)
+            // After SurfaceTexture rotation, effective dimensions swap for portrait
+            val isViewPortrait = viewHeight > viewWidth
+            val isCameraLandscape = cameraPreviewWidth > cameraPreviewHeight
+
+            val effectiveCamW: Float
+            val effectiveCamH: Float
+            if (isViewPortrait && isCameraLandscape) {
+                // stMatrix will rotate 90° → swap dimensions
+                effectiveCamW = cameraPreviewHeight.toFloat()
+                effectiveCamH = cameraPreviewWidth.toFloat()
+            } else {
+                effectiveCamW = cameraPreviewWidth.toFloat()
+                effectiveCamH = cameraPreviewHeight.toFloat()
+            }
+
+            val cameraAspect = effectiveCamW / effectiveCamH
+            val viewAspect = viewWidth.toFloat() / viewHeight.toFloat()
+
+            if (cameraAspect > viewAspect) {
+                // Camera is wider → scale quad width to crop sides
+                val scaleX = cameraAspect / viewAspect
+                Matrix.scaleM(mvp, 0, scaleX, 1f, 1f)
+            } else {
+                // Camera is taller → scale quad height to crop top/bottom
+                val scaleY = viewAspect / cameraAspect
+                Matrix.scaleM(mvp, 0, 1f, scaleY, 1f)
+            }
         }
 
         GLES20.glEnableVertexAttribArray(posHandle)
@@ -470,44 +539,57 @@ class CameraGLSurfaceView @JvmOverloads constructor(
             return
         }
 
+        if (isEncoderReleased || mediaCodec == null || encoderEglSurface == EGL14.EGL_NO_SURFACE) {
+            return
+        }
+
         try {
-            // Switch CHỈ SURFACE, KHÔNG đổi context - để texture vẫn available
+            // Switch sang context và surface của Encoder
             if (!EGL14.eglMakeCurrent(
-                    currentDisplay,
+                    encoderEglDisplay,
                     encoderEglSurface,
                     encoderEglSurface,
-                    currentContext  // Sử dụng CÙNG context của GLSurfaceView
+                    encoderContext
                 )
             ) {
                 val error = EGL14.eglGetError()
-                Log.e(TAG, "Failed to make encoder surface current, error: $error")
+                Log.e(TAG, "Failed to make encoder context current, error: $error")
                 return
             }
 
             // Render camera và overlay vào encoder surface
-            // Sử dụng videoWidth/videoHeight thay vì viewWidth/viewHeight để khớp với MediaCodec config
             GLES20.glViewport(0, 0, videoWidth, videoHeight)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             drawCamera()
             drawOverlay()
 
+            // Cần thiết để đảm bảo GPU render xong trước khi gửi sang encoder
+            GLES20.glFinish()
+
             // Set presentation time
             val pts = System.nanoTime() - recordingStartTimeNano
-            EGLExt.eglPresentationTimeANDROID(currentDisplay, encoderEglSurface, pts)
+            EGLExt.eglPresentationTimeANDROID(encoderEglDisplay, encoderEglSurface, pts)
 
             // Swap buffers để gửi frame đến encoder
-            if (!EGL14.eglSwapBuffers(currentDisplay, encoderEglSurface)) {
+            if (!EGL14.eglSwapBuffers(encoderEglDisplay, encoderEglSurface)) {
                 val error = EGL14.eglGetError()
                 Log.e(TAG, "eglSwapBuffers failed, error: $error")
+            } else {
+                framesSentToEncoder++
+                if (framesSentToEncoder % 60 == 0) {
+                    Log.d(TAG, "Recording: $framesSentToEncoder frames sent")
+                }
             }
 
             // Drain encoder
-            drainEncoder(false)
+            if (!isEncoderReleased) {
+                drainEncoder(false)
+            }
 
         } finally {
-            // Phục hồi surface của GLSurfaceView (vẫn dùng cùng context)
+            // Quay lại screen surface và context của GLSurfaceView
             if (!EGL14.eglMakeCurrent(
-                    currentDisplay,
+                    encoderEglDisplay,
                     savedDrawSurface,
                     savedReadSurface,
                     currentContext
@@ -578,10 +660,70 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         needsOverlayUpdate = false
     }
 
+    // Animation: cập nhật alpha cho từng item (dùng cho fade-in ở level 1)
+    private fun updateItemAnimations() {
+        if (!isAnimatingItems || itemAlphas.isEmpty()) return
+
+        val now = System.currentTimeMillis()
+        val elapsed = now - animationStartTimeMs
+        var allDone = true
+
+        for (i in itemAlphas.indices) {
+            val itemStart = i * animationDelayBetweenItemsMs
+            val itemElapsed = elapsed - itemStart
+            if (itemElapsed < 0) {
+                itemAlphas[i] = 0f
+                allDone = false
+            } else if (itemElapsed < animationDurationPerItemMs) {
+                // Ease-out cubic
+                val progress = itemElapsed.toFloat() / animationDurationPerItemMs.toFloat()
+                val eased = 1f - (1f - progress) * (1f - progress) * (1f - progress)
+                itemAlphas[i] = (eased * 255f).coerceIn(0f, 255f)
+                allDone = false
+            } else {
+                itemAlphas[i] = 255f
+            }
+        }
+
+        if (allDone) {
+            isAnimatingItems = false
+        }
+    }
+
+    // Bắt đầu animation fade-in cho items
+    fun startItemFadeInAnimation() {
+        queueEvent {
+            if (wordItems.isEmpty()) return@queueEvent
+            itemAlphas = FloatArray(wordItems.size) { 0f }
+            animationStartTimeMs = System.currentTimeMillis()
+            isAnimatingItems = true
+            needsOverlayUpdate = true
+        }
+    }
+
+    private fun getBackgroundBitmap(): Bitmap? {
+        if (backgroundBitmap == null) {
+            try {
+                backgroundBitmap = BitmapFactory.decodeResource(context.resources, R.drawable.img_say_word_background)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load background: ${e.message}")
+            }
+        }
+        return backgroundBitmap
+    }
+
     private fun drawWordAnimationGrid() {
-        // Overlay chiếm phần trên của video
-        val w = if (videoWidth > 0) videoWidth else (if (viewWidth > 0) viewWidth else 1080)
-        val h = if (videoHeight > 0) (videoHeight * 0.35f).toInt() else 600
+        val w = if (viewWidth > 0) viewWidth else 1080
+        val actualViewH = if (viewHeight > 0) viewHeight else 1920
+
+        // Dùng density để tính dp → px (giống Compose), đảm bảo đồng nhất trên mọi thiết bị
+        val density = context.resources.displayMetrics.density
+
+        // Chiều cao overlay cố định 200dp (giống Composable height(200.dp))
+        val h = (220f * density).toInt().coerceAtMost(actualViewH)
+
+        // Cập nhật overlayNormalizedHeight để OpenGL quad khớp với bitmap height
+        overlayNormalizedHeight = h.toFloat() / actualViewH.toFloat()
 
         if (overlayBitmap == null || overlayBitmap?.width != w || overlayBitmap?.height != h) {
             overlayBitmap?.recycle()
@@ -589,62 +731,107 @@ class CameraGLSurfaceView @JvmOverloads constructor(
         }
 
         val canvas = Canvas(overlayBitmap!!)
-        canvas.drawColor(Color.WHITE) // Nền trắng như trong Compose
 
-        // Title 1/5 và Recording time
-        textPaint.textAlign = Paint.Align.LEFT
-        textPaint.textSize = 32f
-        textPaint.color = Color.BLACK
-        canvas.drawText("1/5", 40f, 60f, textPaint)
-
-        if (isRecording) {
-            val elapsed = System.currentTimeMillis() - recordingStartTime
-            val elapsedStr = formatTime(elapsed)
-            val timePaint =
-                Paint(textPaint).apply { color = Color.RED; textAlign = Paint.Align.RIGHT }
-            canvas.drawText("REC $elapsedStr", w - 40f, 60f, timePaint)
-            post { onTimeUpdate?.invoke(elapsedStr) }
+        // === Vẽ background image (img_say_word_background) crop fill toàn bộ ===
+        val bg = getBackgroundBitmap()
+        if (bg != null) {
+            val destRect = RectF(0f, 0f, w.toFloat(), h.toFloat())
+            canvas.drawBitmap(bg, null, destRect, null)
+        } else {
+            canvas.drawColor(Color.WHITE)
         }
 
-        // Vẽ Grid (4 cột)
+        // === Tất cả measurements tính bằng dp * density (giống Compose) ===
+
+        // Title "1/5" - fontSize = 20.sp, padding(top = 10.dp) trong Composable
+        val titleTextSize = 20f * density
+        val titlePaddingTop = 20f * density
+        textPaint.textAlign = Paint.Align.CENTER
+        textPaint.textSize = titleTextSize
+        textPaint.color = Color.BLACK
+        textPaint.typeface = Typeface.DEFAULT_BOLD
+        textPaint.alpha = 255
+        // drawText y = baseline = paddingTop + textSize
+        val titleBaselineY = titlePaddingTop + titleTextSize
+        canvas.drawText("$currentLevel/$totalLevels", w / 2f, titleBaselineY, textPaint)
+
+        // === Grid 4x2, chiều rộng 70% (fillMaxWidth(0.7f)), căn giữa ===
         val cols = 4
-        val padding = 30f
-        val spacing = 20f
-        val gridTop = 100f
-        val itemWidth = (w - 2 * padding - (cols - 1) * spacing) / cols
-        val itemHeight = itemWidth * 1.2f
+        val rows = 2
+        val spacing = 5f * density   // Arrangement.spacedBy(5.dp) trong Composable
+        val spacerAfterTitle = 12f * density  // Spacer(Modifier.height(12.dp))
+        val gridTop = titleBaselineY + spacerAfterTitle
+
+        // Grid width = 70% chiều rộng overlay (fillMaxWidth(0.7f))
+        val maxGridWidth = w * 0.7f
+
+        // Item vuông (aspectRatio(1f) trong Composable)
+        val itemSizeByWidth = (maxGridWidth - (cols - 1) * spacing) / cols
+
+        // Tính item size tối đa theo chiều cao khả dụng (tránh kéo dãn)
+        val bottomPadding = 5f * density
+        val availableGridH = h - gridTop - bottomPadding
+        val itemSizeByHeight = (availableGridH - (rows - 1) * spacing) / rows
+
+        // Lấy min để item vừa theo cả 2 chiều, không bị tràn
+        val itemSize = minOf(itemSizeByWidth, itemSizeByHeight)
+
+        // Tính offset để căn giữa grid
+        val actualGridWidth = cols * itemSize + (cols - 1) * spacing
+        val actualGridHeight = rows * itemSize + (rows - 1) * spacing
+        val gridOffsetX = (w - actualGridWidth) / 2f
+
+        // Căn giữa grid trong phần dưới title
+        val remainingH = h - gridTop
+        val gridOffsetY = gridTop + (remainingH - actualGridHeight) / 2f
 
         for (i in wordItems.indices) {
             val row = i / cols
             val col = i % cols
-            val left = padding + col * (itemWidth + spacing)
-            val top = gridTop + row * (itemHeight + spacing)
-            val right = left + itemWidth
-            val bottom = top + itemHeight
+            val left = gridOffsetX + col * (itemSize + spacing)
+            val top = gridOffsetY + row * (itemSize + spacing)
+            val right = left + itemSize
+            val bottom = top + itemSize
 
-            // Vẽ border
-            val isActive = (i == activeWordIndex)
-            borderPaint.color = if (isActive) Color.parseColor("#00C853") else Color.BLACK
-            borderPaint.strokeWidth = if (isActive) 10f else 4f
-            canvas.drawRect(left, top, right, bottom, borderPaint)
+            // Alpha cho animation (giữ nguyên)
+            val alpha = if (isAnimatingItems && i < itemAlphas.size) {
+                itemAlphas[i].toInt().coerceIn(0, 255)
+            } else {
+                255
+            }
 
-            // Vẽ Icon (căn giữa phần trên của item)
+            // Ảnh crop fill toàn bộ ô vuông (ContentScale.Crop)
             val item = wordItems[i]
             val icon = getIconBitmap(item.image)
             if (icon != null) {
-                val iconSize = itemWidth * 0.55f
-                val iconLeft = left + (itemWidth - iconSize) / 2
-                val iconTop = top + 20f
-                val destRect = RectF(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize)
-                canvas.drawBitmap(icon, null, destRect, null)
+                val destRect = RectF(left, top, right, bottom)
+                val iconPaint = Paint().apply { this.alpha = alpha }
+                canvas.drawBitmap(icon, null, destRect, iconPaint)
             }
 
-            // Vẽ Label
-            textPaint.textAlign = Paint.Align.CENTER
-            textPaint.textSize = 26f
-            textPaint.color = Color.BLACK
-            canvas.drawText(item.label, left + itemWidth / 2, bottom - 25f, textPaint)
+            // Vẽ border lên trên ảnh (giữ nguyên logic thay đổi màu)
+            val isActive = (i == activeWordIndex)
+            val borderWidth = if (showBorder) {
+                if (isActive) 3f * density else 2f * density  // border(width = 2.dp)
+            } else {
+                1f * density
+            }
+            if (showBorder) {
+                borderPaint.color = if (isActive) "#00C853".toColorInt() else Color.GRAY
+                borderPaint.strokeWidth = borderWidth
+                borderPaint.alpha = alpha
+                canvas.drawRect(left, top, right, bottom, borderPaint)
+            } else {
+                borderPaint.color = Color.LTGRAY
+                borderPaint.strokeWidth = borderWidth
+                borderPaint.alpha = alpha
+                canvas.drawRect(left, top, right, bottom, borderPaint)
+            }
         }
+
+        // Reset alpha
+        textPaint.alpha = 255
+        borderPaint.alpha = 255
     }
 
     private fun getIconBitmap(resId: Int): Bitmap? {
@@ -661,6 +848,9 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     fun setWordItems(items: List<WordItem>) {
         queueEvent {
             wordItems = items
+            // Reset animation alpha
+            itemAlphas = FloatArray(items.size) { 255f }
+            isAnimatingItems = false
             needsOverlayUpdate = true
         }
     }
@@ -671,6 +861,23 @@ class CameraGLSurfaceView @JvmOverloads constructor(
                 activeWordIndex = index
                 needsOverlayUpdate = true
             }
+        }
+    }
+
+    fun setCurrentLevel(level: Int) {
+        queueEvent {
+            currentLevel = level
+            // Sau khi hết level 5, tắt border xanh
+            showBorder = level <= totalLevels
+            needsOverlayUpdate = true
+        }
+        post { onLevelChanged?.invoke(level) }
+    }
+
+    fun setShowBorder(show: Boolean) {
+        queueEvent {
+            showBorder = show
+            needsOverlayUpdate = true
         }
     }
 
@@ -705,6 +912,11 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
     fun setFrontCamera(front: Boolean) {
         isFrontCamera = front
+    }
+
+    fun setCameraPreviewSize(width: Int, height: Int) {
+        cameraPreviewWidth = width
+        cameraPreviewHeight = height
     }
 
     fun setOverlayText(text: String) {
@@ -748,6 +960,9 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
         queueEvent {
             try {
+                // Reset encoder released flag
+                isEncoderReleased = false
+
                 // Create output file
                 outputFile = createOutputFile(ctx)
 
@@ -809,60 +1024,49 @@ class CameraGLSurfaceView @JvmOverloads constructor(
                 encoderSurface = mediaCodec?.createInputSurface()
                 mediaCodec?.start()
 
-                Log.d(TAG, "MediaCodec started, creating EGL surface...")
+                Log.d(TAG, "MediaCodec started, creating encoder EGL environment...")
 
-                // Lấy EGL display và config từ GLSurfaceView context hiện tại
                 val currentDisplay = EGL14.eglGetCurrentDisplay()
                 val currentContext = EGL14.eglGetCurrentContext()
+                encoderEglDisplay = currentDisplay
 
-                // Query config ID từ current context
-                val configId = IntArray(1)
-                EGL14.eglQueryContext(
-                    currentDisplay,
-                    currentContext,
-                    EGL14.EGL_CONFIG_ID,
-                    configId,
-                    0
-                )
-
-                // Tìm config với ID đó
-                val configAttribs = intArrayOf(
-                    EGL14.EGL_CONFIG_ID, configId[0],
+                // 1. Tìm Config Recordable chuẩn cho Encoder
+                val attribList = intArrayOf(
+                    EGL14.EGL_RED_SIZE, 8,
+                    EGL14.EGL_GREEN_SIZE, 8,
+                    EGL14.EGL_BLUE_SIZE, 8,
+                    EGL14.EGL_ALPHA_SIZE, 8,
+                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                    EGL_RECORDABLE_ANDROID, 1,
                     EGL14.EGL_NONE
                 )
                 val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
                 val numConfigs = IntArray(1)
-                EGL14.eglChooseConfig(
-                    currentDisplay,
-                    configAttribs,
-                    0,
-                    configs,
-                    0,
-                    1,
-                    numConfigs,
-                    0
-                )
+                EGL14.eglChooseConfig(currentDisplay, attribList, 0, configs, 0, 1, numConfigs, 0)
+                val encoderConfig = configs[0] ?: throw RuntimeException("No recordable EGL config")
 
-                val currentConfig = configs[0]
-                Log.d(TAG, "Using config from GLSurfaceView context, configId: ${configId[0]}")
+                // 2. Tạo Encoder Context riêng và SHARE với main context (dùng chung texture)
+                val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+                encoderContext = EGL14.eglCreateContext(currentDisplay, encoderConfig, currentContext, ctxAttribs, 0)
+                if (encoderContext == EGL14.EGL_NO_CONTEXT) {
+                    throw RuntimeException("Failed to create shared encoder EGL context")
+                }
 
-                // Create EGL surface for encoder với config của GLSurfaceView
+                // 3. Tạo Surface
                 val surfaceAttribs = intArrayOf(EGL14.EGL_NONE)
                 encoderEglSurface = EGL14.eglCreateWindowSurface(
                     currentDisplay,
-                    currentConfig,
+                    encoderConfig,
                     encoderSurface,
                     surfaceAttribs,
                     0
                 )
 
                 if (encoderEglSurface == EGL14.EGL_NO_SURFACE) {
-                    val error = EGL14.eglGetError()
-                    Log.e(TAG, "Failed to create encoder EGL surface, error: $error")
                     throw RuntimeException("Failed to create encoder EGL surface")
                 }
 
-                Log.d(TAG, "Encoder EGL surface created successfully")
+                Log.d(TAG, "Encoder EGL context and surface created (Shared Context mode)")
 
                 // Setup MediaMuxer
                 mediaMuxer = MediaMuxer(
@@ -874,10 +1078,11 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
                 recordingStartTime = System.currentTimeMillis()
                 recordingStartTimeNano = System.nanoTime()  // Cho presentation time
+                framesSentToEncoder = 0
                 isRecording = true
 
                 post { onRecordingStateChanged?.invoke(true, null) }
-                Log.d(TAG, "Recording started")
+                Log.d(TAG, "Recording started, videoSize: ${videoWidth}x${videoHeight}")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Start recording failed: ${e.message}", e)
@@ -889,6 +1094,9 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     fun stopRecording(ctx: Context) {
         if (!isRecording) return
 
+        // Chỉ set isRecording = false trước queueEvent
+        // Điều này ngăn onDrawFrame gửi frame mới vào encoder
+        // KHÔNG set isEncoderReleased ở đây - để drainEncoder drain hết frames
         isRecording = false
 
         // Lưu lại output file trước khi release
@@ -896,40 +1104,82 @@ class CameraGLSurfaceView @JvmOverloads constructor(
 
         queueEvent {
             try {
-                Log.d(TAG, "Stopping recording...")
+                Log.d(TAG, "Stopping recording... framesSent=$framesSentToEncoder")
 
                 // Final drain - đảm bảo tất cả frames được ghi
-                drainEncoder(true)
+                // isEncoderReleased vẫn = false ở đây → drainEncoder sẽ drain đầy đủ
+                try {
+                    drainEncoder(true)
+                    Log.d(TAG, "Drain complete successfully")
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "drainEncoder error during stop: ${e.message}")
+                }
 
-                Log.d(TAG, "Drain complete, stopping codec...")
+                // SAU KHI drain xong, đánh dấu encoder released
+                isEncoderReleased = true
 
-                mediaCodec?.stop()
-                mediaCodec?.release()
+                Log.d(TAG, "Stopping codec...")
 
-                Log.d(TAG, "Codec stopped, muxerStarted=$muxerStarted")
+                // Wrap từng bước trong try-catch riêng
+                try {
+                    mediaCodec?.stop()
+                    Log.d(TAG, "Codec stopped")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Codec stop error (may be expected): ${e.message}")
+                }
+
+                try {
+                    mediaCodec?.release()
+                    Log.d(TAG, "Codec released")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Codec release error: ${e.message}")
+                }
+
+                Log.d(TAG, "muxerStarted=$muxerStarted")
 
                 if (muxerStarted) {
-                    mediaMuxer?.stop()
-                    Log.d(TAG, "Muxer stopped")
+                    try {
+                        mediaMuxer?.stop()
+                        Log.d(TAG, "Muxer stopped")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Muxer stop error: ${e.message}")
+                    }
                 }
-                mediaMuxer?.release()
+                try {
+                    mediaMuxer?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Muxer release error: ${e.message}")
+                }
 
+                // Destroy EGL surface - dùng current display thay vì member eglDisplay
+                val currentDisplay = EGL14.eglGetCurrentDisplay()
                 if (encoderEglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, encoderEglSurface)
+                    EGL14.eglDestroySurface(encoderEglDisplay, encoderEglSurface)
+                }
+                if (encoderContext != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglDestroyContext(encoderEglDisplay, encoderContext)
                 }
                 encoderSurface?.release()
+                encoderContext = EGL14.EGL_NO_CONTEXT
+                encoderEglDisplay = EGL14.EGL_NO_DISPLAY
+                encoderEglSurface = EGL14.EGL_NO_SURFACE
 
                 // Sử dụng file đã ghi trong cache
                 val finalPath = savedOutputFile?.absolutePath
+                val fileSize = savedOutputFile?.length() ?: 0
 
                 Log.d(
                     TAG,
-                    "Recording stopped, file: $finalPath, exists: ${savedOutputFile?.exists()}, size: ${savedOutputFile?.length()}"
+                    "Recording stopped, file: $finalPath, exists: ${savedOutputFile?.exists()}, size: $fileSize"
                 )
 
-                // File đã được lưu trong cache, không cần lưu vào gallery
-
-                post { onRecordingStateChanged?.invoke(false, finalPath) }
+                // Chỉ gọi callback với path nếu file thực sự có data
+                if (fileSize > 0) {
+                    post { onRecordingStateChanged?.invoke(false, finalPath) }
+                } else {
+                    Log.e(TAG, "Video file is empty! muxerStarted=$muxerStarted, framesSent=$framesSentToEncoder")
+                    post { onRecordingStateChanged?.invoke(false, null) }
+                }
 
             } catch (e: Exception) {
                 Log.e(TAG, "Stop recording error: ${e.message}", e)
@@ -949,14 +1199,27 @@ class CameraGLSurfaceView @JvmOverloads constructor(
     private fun drainEncoder(eos: Boolean) {
         if (eos) {
             Log.d(TAG, "drainEncoder: signaling end of stream")
-            mediaCodec?.signalEndOfInputStream()
+            try {
+                mediaCodec?.signalEndOfInputStream()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "signalEndOfInputStream failed: ${e.message}")
+                return
+            }
         }
 
         val codec = mediaCodec ?: return
         var frameCount = 0
 
         while (true) {
-            val idx = codec.dequeueOutputBuffer(bufferInfo, if (eos) 10000 else 0)
+            // Guard against calling dequeueOutputBuffer on a released codec
+            if (isEncoderReleased && !eos) return
+
+            val idx = try {
+                codec.dequeueOutputBuffer(bufferInfo, if (eos) 10000 else 0)
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "dequeueOutputBuffer failed (codec may be released): ${e.message}")
+                break
+            }
 
             when {
                 idx == MediaCodec.INFO_TRY_AGAIN_LATER -> {

@@ -4,10 +4,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,90 +32,75 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.bigq.demodogcat.R
 import kotlinx.coroutines.delay
 import timber.log.Timber
 
+@Preview
 @Composable
-fun BoxWordAnimation(
-    isRecording: Boolean,
-) {
-    var activeBorderIndex by remember { mutableIntStateOf(-1) }
-
-    LaunchedEffect(isRecording) {
-        if (!isRecording) {
-            activeBorderIndex = -1
-            return@LaunchedEffect
-        }
-        delay(5000)
-        for (i in wordList.indices) {
-            activeBorderIndex = i
-
-            delay(400)
-        }
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.White)
-    ) {
+fun BoxSayTheWord(
+    modifier: Modifier = Modifier
+){
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(200.dp)
+    ){
+        Image(
+            painter = painterResource(R.drawable.img_say_word_background),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .fillMaxSize()
+        )
         Column(
-            modifier = Modifier.fillMaxWidth()
-        ) {
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ){
             Text(
                 text = "1/5",
-                fontSize = 16.sp,
-                color = Color.Black,
-                fontWeight = FontWeight.Black
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Black
             )
-
-            Spacer(Modifier.height(10.dp))
-
+            Spacer(Modifier.height(12.dp))
             LazyVerticalGrid(
                 columns = GridCells.Fixed(4),
-                contentPadding = PaddingValues(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
                 verticalArrangement = Arrangement.spacedBy(5.dp),
-                horizontalArrangement = Arrangement.spacedBy(7.dp)
+                modifier = Modifier
+                    .fillMaxWidth(0.7f)
             ) {
-                itemsIndexed(wordList) { index, item ->
-
-                    ItemWord(
-                        item = item,
-                        isActive = index == activeBorderIndex
-                    )
+                items(4){
+                    WordItem()
+                }
+                items(4){
+                    WordItem()
                 }
             }
         }
     }
 }
 
+@Preview
 @Composable
-fun ItemWord(
-    item: WordItem,
-    isActive: Boolean,
-) {
-    val borderColor =
-        if (isActive) Color(0xFF00C853)
-        else Color.Black
-
-    Column(
+private fun WordItem(){
+    Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .border(width = 3.dp, color = borderColor)
-            .padding(8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+            .aspectRatio(1f)
+            .border(width = 2.dp, color = Color.Gray)
+    ){
         Image(
-            painter = painterResource(item.image),
+            painter = painterResource(R.drawable.img_dog_2),
             contentDescription = null,
-            modifier = Modifier.size(50.dp),
-            contentScale = ContentScale.Crop
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .fillMaxSize()
         )
-
-        Spacer(Modifier.height(10.dp))
-
-        Text(text = item.label)
     }
 }
